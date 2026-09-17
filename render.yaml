@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: freellmapi
+    runtime: node
+    plan: free
+    branch: main
+    autoDeploy: true
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: bash scripts/render-start.sh
+    healthCheckPath: /api/ping
+    envVars:
+      - key: NODE_VERSION
+        value: 22.14.0
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: TRUST_PROXY
+        value: "1"
+      - key: FREEAPI_DB_PATH
+        value: /tmp/freeapi.db
+      - key: REQUEST_BODY_LIMIT_MB
+        value: "16"
+      - key: PROXY_RATE_LIMIT_RPM
+        value: "60"
+      - key: ENCRYPTION_SEED
+        generateValue: true
