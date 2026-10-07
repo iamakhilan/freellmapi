@@ -28,6 +28,10 @@ services:
       # Set this once in the Render Dashboard; never commit the JSON or provider keys.
       - key: FREEAPI_CONFIG_JSON
         sync: false
+      # Durable unified /v1 API credential. Set once in the Render Dashboard;
+      # it must not be committed to the repository.
+      - key: FREEAPI_UNIFIED_API_KEY
+        sync: false
       # Must remain stable so credentials restored into a fresh DB can be decrypted.
       - key: ENCRYPTION_SEED
         generateValue: true
