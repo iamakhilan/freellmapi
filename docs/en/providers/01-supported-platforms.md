@@ -36,16 +36,16 @@ Of the 43 built-in platforms, **10 use dedicated adapters** and **33 ride `OpenA
 | `pollinations` | Pollinations | Keyed | Native (`PollinationsProvider`) | `GET /v1/models` answers 200 even for revoked keys, so validation probes the authenticated `/account/key` instead (#608). |
 | `llm7` | LLM7.io | Keyed (anonymous works for basic models) | OpenAI-compat | 100 req/hr free tier. |
 | `huggingface` | Hugging Face Router | Keyed | OpenAI-compat | `router.huggingface.co` meta-router (re-added V13); recurring $0.10/mo router credit on the free tier. |
-| `opencode` | OpenCode Zen | Keyed | OpenAI-compat | Trial-only promotional free roster, docs-confirmed ids seeded via `migrateModelsV18`. |
+| `opencode` | OpenCode Zen | Keyed | OpenAI-compat | Free roster is locked to the OpenCode client since 2026-09 (403 FreeTierError, #1249) and disabled in the catalog; paid models only. |
 | `ovh` | OVHcloud AI Endpoints | Keyless | OpenAI-compat | Anonymous tier: 2 req/min per IP per model (observed stricter); authenticated tier requires a Public Cloud project with payment method on file (`migrateModelsV26`). |
 | `agnes` | Agnes AI | Keyed | OpenAI-compat | Proprietary models served at $0/token promotionally; ~30 concurrent requests before 429s; 60s timeout for reasoning TTFB. |
-| `reka` | Reka | Keyed | OpenAI-compat | Free via recurring monthly credit grant (no card); balance dashboard-only. |
+| `reka` | Reka | Keyed | OpenAI-compat | No free tier for new accounts since 2026-09: prepaid credits required (#1202). Accounts that still hold credit keep working; balance dashboard-only. |
 | `siliconflow` | SiliconFlow | Keyed | OpenAI-compat | Registered mainly for FREE generative-media models (FLUX.1-schnell image, CosyVoice2 TTS) routed via `services/media.ts`. |
 | `routeway` | Routeway | Keyed | OpenAI-compat | Requires browser-style User-Agent (Cloudflare rejects others with error 1010); free pool observed stricter (~5 rpm) than the documented 20 rpm / 200 rpd. |
 | `bazaarlink` | BazaarLink | Keyed | OpenAI-compat | Only the `auto:free` route is cataloged — direct model ids are paid (#385). |
 | `ainative` | AINative Studio | Keyed | OpenAI-compat | Advertises recurring ~10M tokens/month free allocation; quota treated as unverified until confirmed by a real account. |
 | `aion` | Aion Labs | Keyed | OpenAI-compat | No-card free key; availability catalog-managed behind the 30-day age gate. |
-| `requesty` | Requesty | Keyed | OpenAI-compat | Router endpoint at `router.requesty.ai/v1`; free rows age into the monthly catalog. |
+| `requesty` | Requesty | Keyed | OpenAI-compat | Router endpoint at `router.requesty.ai/v1`; free rows age into the monthly catalog; the free tier is 200 requests/day shared across all free models. |
 | `navy` | NavyAI | Keyed | OpenAI-compat | Free plan: 150K tokens/day and 20 RPM; live smoke tests require an explicit User-Agent header. |
 | `nara` | NaraRouter | Keyed | OpenAI-compat | Free plan additionally requires Telegram channel/link verification; live-probed 2026-07-09. |
 | `sealion` | SEA-LION (AI Singapore) | Keyed | OpenAI-compat | First-party API; Google sign-in, no card, no region wall; 10 RPM recurring free tier. |

@@ -11,7 +11,8 @@ import type {
 } from '@freellmapi/shared/types.js';
 import { routeRequest, resolveModelGroupCandidates, resolveRoutingChain, resolveStickyPreference, routingReserveTokens, type RouteResult, type ResolvedChain, type ChainRow } from '../services/router.js';
 import { getSetting, getUnifiedApiKey } from '../db/index.js';
-import { contentToString } from '../lib/content.js';
+import { contentToString, estimateInputTokens } from '../lib/content.js';
+import { routeOutputBudget } from '../lib/output-cap.js';
 import { resolveTaskType } from '../lib/task-type.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { invalidToolArgumentsError, invalidToolCallReasons, isToolArgumentValidationEnabled } from '../lib/tool-validate.js';
@@ -21,7 +22,7 @@ import { convertDocumentBlock, documentRejectionMessage } from '../lib/anthropic
 import { isClientAbortError, newClientAbortError, newHedgeAbortError, isUpstreamClassificationOutput } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
 import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel } from './proxy.js';
-import { runFallbackLoop, newFallbackState, fallbackRoutingTokens, recordUpstreamSuccess, type ExhaustionBody, setFallbackHeaders, setExhaustionHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
+import { runFallbackLoop, newFallbackState, fallbackRoutingTokens, recordUpstreamSuccess, type ExhaustionBody, setFallbackHeaders, setExhaustionHeaders, type AttemptRecord, type FallbackState } from '../lib/fallback-loop.js';
 import { routedViaValue } from '../lib/header-value.js';
 import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
 import { resolveAnthropicModel, claudeFamilyDiscoveryEntries } from '../services/anthropic-map.js';
@@ -374,10 +375,6 @@ function convertRequest(input: AnthropicRequest): ConvertedRequest {
   };
 }
 
-function estimateTokens(messages: ChatMessage[]): number {
-  return messages.reduce((sum, m) => sum + Math.ceil(contentToString(m.content).length / 4), 0);
-}
-
 // Model resolution (Claude family → auto | pinned catalog model) lives in
 // services/anthropic-map.ts so the dashboard mapping editor and this route
 // share one source of truth. Claude Code keeps its built-in `claude-*` names;
@@ -505,7 +502,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   messages = compressionResult.messages;
   res.setHeader('X-FreeLLM-Compress', formatCompressionHeader(compressionResult));
 
-  const estimatedInputTokens = estimateTokens(messages);
+  const estimatedInputTokens = estimateInputTokens(messages, tools);
   const imageCount = messages.reduce((n, m) =>
     n + (Array.isArray(m.content) ? m.content.filter(b => (b as any)?.type === 'image_url').length : 0), 0);
 
@@ -620,6 +617,8 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   // when every provider rejected the request, not always a 429), and applies the
   // inline tool-call dialect rescue that the OpenAI/Responses surfaces carry.
   const state = newFallbackState();
+  // Lets the failover loop learn which models reject tool calls (#1230).
+  state.wantsTools = wantsTools;
   const attemptLog: AttemptRecord[] = [];
   // Client-disconnect fan-out: the flag stops the loop before the NEXT
   // attempt; the AbortController (threaded to the provider as
@@ -658,11 +657,13 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       return routeRequest(routingTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain, false, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined, outputReserve, taskType);
     },
     dispatch: async (route, attempt, dispatchCtx) => {
+      const contextBudget = routeOutputBudget(route, estimatedInputTokens);
+      const routeOptions = { ...dispatchOptions, contextBudget };
       if (stream) {
         try {
-          await streamCompletion(res, route, messages, dispatchOptions, {
+          await streamCompletion(res, route, messages, routeOptions, {
             start, attempt, attemptLog, clientGone: () => clientGone, requestedModel, estimatedInputTokens, tools, pinnedModelId,
-            sessionId, pinned: resolved.pinned, stickyScope, strategyKey, disarmHedge: dispatchCtx.disarmHedge,
+            sessionId, pinned: resolved.pinned, stickyScope, strategyKey, disarmHedge: dispatchCtx.disarmHedge, state,
           });
           return 'done';
         } catch (err: any) {
@@ -673,7 +674,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
         }
       }
 
-      const result = await route.provider.chatCompletion(route.apiKey, messages, route.modelId, dispatchOptions);
+      const result = await route.provider.chatCompletion(route.apiKey, messages, route.modelId, routeOptions);
       const respMsg = result.choices?.[0]?.message;
       const respText = contentToString(respMsg?.content ?? '');
       let respToolCalls = respMsg?.tool_calls ?? [];
@@ -739,7 +740,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       const promptTokens = result.usage?.prompt_tokens ?? estimatedInputTokens;
       const completionTokens = result.usage?.completion_tokens ?? Math.ceil((respText.length + respToolCalls.reduce((n, c) => n + c.function.arguments.length, 0)) / 4);
 
-      recordUpstreamSuccess(route, result.usage?.total_tokens ?? promptTokens + completionTokens);
+      recordUpstreamSuccess(route, result.usage?.total_tokens ?? promptTokens + completionTokens, state);
       // Remember this model for the rest of the auto-routed session. A pin used
       // to make this a no-op (the pin fixed the model); a group pin still has a
       // provider choice to remember, recorded under the group's own scope.
@@ -802,6 +803,8 @@ interface StreamCtx {
   strategyKey?: string;
   /** Cancel this attempt's time-budget hedge once the stream commits. */
   disarmHedge: () => void;
+  /** The request's failover state, so a served tool request can be learned from (#1230). */
+  state: FallbackState;
 }
 
 // Consume the provider's OpenAI-style stream and re-emit it as the Anthropic
@@ -1055,7 +1058,7 @@ async function streamCompletion(
     writeSse(res, 'message_stop', { type: 'message_stop' });
     res.end();
 
-    recordUpstreamSuccess(route, ctx.estimatedInputTokens + outputTokens);
+    recordUpstreamSuccess(route, ctx.estimatedInputTokens + outputTokens, ctx.state);
     if (!ctx.pinned || ctx.stickyScope) setStickyModel(messages, route.modelDbId, ctx.sessionId, ctx.stickyScope ?? ctx.strategyKey);
     logRequest(route.platform, route.modelId, route.keyId, 'success', ctx.estimatedInputTokens, outputTokens, Date.now() - ctx.start, null, null, ctx.pinnedModelId, null, 'http');
   } catch (err: any) {
@@ -1103,7 +1106,7 @@ anthropicRouter.post('/messages/count_tokens', (req: Request, res: Response) => 
     recordStats: false,
   });
   res.setHeader('X-FreeLLM-Compress', formatCompressionHeader(compressionResult));
-  res.json({ input_tokens: estimateTokens(compressionResult.messages) });
+  res.json({ input_tokens: estimateInputTokens(compressionResult.messages, tools) });
 });
 
 // Anthropic-compatible GET /v1/models. Content-negotiated: only answers when
