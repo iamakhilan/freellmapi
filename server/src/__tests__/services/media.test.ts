@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { initDb, getDb } from '../../db/index.js';
 import { encrypt } from '../../lib/crypto.js';
 import { runImageGeneration, runVideoGeneration, runSpeech } from '../../services/media.js';
+import { registerCustomMediaModel } from '../../services/custom-media-register.js';
 
 const realFetch = globalThis.fetch;
 
@@ -286,6 +287,27 @@ describe('media service', () => {
       const log = getDb().prepare("SELECT key_id FROM requests WHERE request_type = 'image' ORDER BY id DESC LIMIT 1").get() as { key_id: number };
       expect(log.key_id).toBe(keyId);
     });
+
+    it('fails over between endpoints sharing an image model id with their own keys', async () => {
+      const first = addCustomKey('http://127.0.0.1:8282/v1', 'first-key');
+      const second = addCustomKey('http://127.0.0.1:8383/v1', 'second-key');
+      for (const key of [first, second]) {
+        registerCustomMediaModel(getDb(), key, { modelId: 'shared-image', displayName: null, modality: 'image' });
+      }
+      const fetchMock = vi.fn(async (url: string) => String(url).includes(':8282/')
+        ? new Response('unavailable', { status: 503 })
+        : jsonResponse({ data: [{ url: 'https://example.test/image.png' }] }));
+      globalThis.fetch = fetchMock as any;
+      await expect(runImageGeneration('shared-image', { prompt: 'a cat' })).resolves.toMatchObject({
+        images: [{ url: 'https://example.test/image.png' }],
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const calls = fetchMock.mock.calls as unknown as [string, RequestInit][];
+      expect(String(calls[0][0])).toContain(':8282/');
+      expect(new Headers(calls[0][1].headers).get('Authorization')).toBe('Bearer first-key');
+      expect(String(calls[1][0])).toContain(':8383/');
+      expect(new Headers(calls[1][1].headers).get('Authorization')).toBe('Bearer second-key');
+    });
   });
 
   describe('video generation', () => {
@@ -472,6 +494,81 @@ describe('media service', () => {
   });
 
   describe('text-to-speech', () => {
+    const freeAiUrl = 'https://api.free.ai/static/outputs/1bcc722e-4ddf-4e15-995a-b274000f99e5.wav';
+    const freeAiWav = () => { const b = Buffer.alloc(48); b.write('RIFF'); b.write('WAVE', 8); return b; };
+
+    it('Free.ai maps OpenAI fields to Kokoro and downloads verified WAV without credentials', async () => {
+      addMedia('freeai', 'kokoro', 'audio'); addKey('freeai');
+      const wav = freeAiWav();
+      const fetchMock = vi.spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce(jsonResponse({ audio_url: freeAiUrl }))
+        .mockResolvedValueOnce(new Response(wav, { headers: { 'Content-Type': 'audio/wav' } }));
+      const result = await runSpeech('kokoro', { input: 'Hello', voice: 'alloy' });
+      expect(result.audio).toEqual(wav);
+      expect(result.contentType).toBe('audio/wav');
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe('https://api.free.ai/v1/tts/');
+      expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer freeai-test-key');
+      expect(JSON.parse(String(init?.body))).toEqual({ model: 'kokoro', text: 'Hello', voice: 'af_heart' });
+      expect(fetchMock.mock.calls[1][0]).toBe(freeAiUrl);
+      expect(new Headers(fetchMock.mock.calls[1][1]?.headers).has('Authorization')).toBe(false);
+      for (const [, request] of fetchMock.mock.calls) expect(request?.redirect).toBe('error');
+    });
+
+    it('Free.ai preserves native voices and explicit WAV requests', async () => {
+      addMedia('freeai', 'kokoro', 'audio'); addKey('freeai');
+      const fetchMock = vi.spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce(jsonResponse({ audio_url: freeAiUrl }))
+        .mockResolvedValueOnce(new Response(freeAiWav()));
+      await runSpeech('kokoro', { input: 'Hello', voice: 'af_heart', format: 'wav' });
+      expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body)).voice).toBe('af_heart');
+    });
+
+    it.each(['mp3', 'pcm', 'flac', 'opus'])('Free.ai rejects unsupported %s before generating', async format => {
+      addMedia('freeai', 'kokoro', 'audio'); addKey('freeai');
+      const fetchMock = vi.spyOn(globalThis, 'fetch');
+      await expect(runSpeech('kokoro', { input: 'Hello', format })).rejects.toThrow('supports wav');
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('Free.ai never sends untested or premium model IDs', async () => {
+      addMedia('freeai', 'premium/voice', 'audio'); addKey('freeai');
+      const fetchMock = vi.spyOn(globalThis, 'fetch');
+      await expect(runSpeech('premium/voice', { input: 'Hello' })).rejects.toThrow('not a tested free route');
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each([{}, { audio_url: 'http://169.254.169.254/latest/meta-data/' }, { audio_url: 'https://example.com/test.wav' }])('Free.ai never downloads unsafe output', async body => {
+      addMedia('freeai', 'kokoro', 'audio'); addKey('freeai');
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse(body));
+      await expect(runSpeech('kokoro', { input: 'Hello' })).rejects.toThrow('unsafe audio URL');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('Free.ai rejects JSON and oversized output instead of labelling them audio', async () => {
+      addMedia('freeai', 'kokoro', 'audio'); addKey('freeai');
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(jsonResponse({ audio_url: freeAiUrl }))
+        .mockResolvedValueOnce(jsonResponse({ error: 'not audio' }))
+        .mockResolvedValueOnce(jsonResponse({ audio_url: freeAiUrl }))
+        .mockResolvedValueOnce(new Response(freeAiWav(), { headers: { 'Content-Length': String(21 * 1024 * 1024) } }));
+      await expect(runSpeech('kokoro', { input: 'Hello' })).rejects.toThrow('recognized WAV');
+      await expect(runSpeech('kokoro', { input: 'Hello' })).rejects.toThrow('too large');
+    });
+
+    it('Free.ai preserves quota backoff without retrying a paid model', async () => {
+      addMedia('freeai', 'kokoro', 'audio'); addKey('freeai');
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('quota', { status: 429, headers: { 'Retry-After': '30' } }));
+      await expect(runSpeech('kokoro', { input: 'Hello' })).rejects.toMatchObject({ status: 429, retryAfterMs: 30000 });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('Free.ai reports queued work without following a poll URL or resubmitting generation', async () => {
+      addMedia('freeai', 'kokoro', 'audio'); addKey('freeai');
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ queued: true, job_id: 'test', poll_url: 'https://example.com/private' }));
+      await expect(runSpeech('kokoro', { input: 'Hello' })).rejects.toMatchObject({ status: 502, code: 'upstream_queued' });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
     it.each(['simba-3.0', 'simba-3.2'])('Speechify %s sends native fields and decodes JSON audio', async model => {
       addMedia('speechify', model, 'audio');
       addKey('speechify');
@@ -508,14 +605,14 @@ describe('media service', () => {
       await expect(runSpeech('test-simba', { input: 'Hello' })).rejects.toThrow('Speechify returned');
     });
 
-    it('Cloudflare MeloTTS: base64 audio → audio/mpeg bytes', async () => {
+    it('Cloudflare MeloTTS: base64 audio → audio/wav bytes', async () => {
       addMedia('cloudflare', '@cf/myshell-ai/melotts', 'audio');
       addKey('cloudflare', 'acct:tok');
-      const fetchMock = vi.fn(async () => jsonResponse({ result: { audio: Buffer.from('MP3').toString('base64') } }));
+      const fetchMock = vi.fn(async () => jsonResponse({ result: { audio: Buffer.from('WAV').toString('base64') } }));
       globalThis.fetch = fetchMock as any;
       const r = await runSpeech('@cf/myshell-ai/melotts', { input: 'hi', voice: 'alloy' });
-      expect(r.contentType).toBe('audio/mpeg');
-      expect(r.audio.toString()).toBe('MP3');
+      expect(r.contentType).toBe('audio/wav');
+      expect(r.audio.toString()).toBe('WAV');
       const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
       expect(body).toMatchObject({ prompt: 'hi', lang: 'en' });
     });
@@ -571,6 +668,27 @@ describe('media service', () => {
       expect(r.audio.length).toBe(48);
       const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
       expect(body.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName).toBe('Schedar');
+    });
+
+    it.each(['gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts'])('Gemini TTS: passes through existing WAV bytes for %s', async model => {
+      addMedia('google', model, 'audio');
+      addKey('google');
+      const wav = Buffer.alloc(48);
+      wav.write('RIFF', 0); wav.writeUInt32LE(40, 4); wav.write('WAVE', 8);
+      wav.write('fmt ', 12); wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20);
+      wav.writeUInt16LE(1, 22); wav.writeUInt32LE(24000, 24); wav.writeUInt32LE(48000, 28);
+      wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34); wav.write('data', 36); wav.writeUInt32LE(4, 40);
+      globalThis.fetch = vi.fn(async () => jsonResponse({ candidates: [{ content: { parts: [{ inlineData: { mimeType: 'audio/wav', data: wav.toString('base64') } }] } }] }));
+      const result = await runSpeech(model, { input: 'hello' });
+      expect(result.audio).toEqual(wav);
+      expect(result.contentType).toBe('audio/wav');
+    });
+
+    it('Gemini TTS: rejects an invalid declared WAV rather than wrapping it as PCM', async () => {
+      addMedia('google', 'gemini-3.8-flash-tts', 'audio');
+      addKey('google');
+      globalThis.fetch = vi.fn(async () => jsonResponse({ candidates: [{ content: { parts: [{ inlineData: { mimeType: 'audio/wav', data: Buffer.from('not audio').toString('base64') } }] } }] }));
+      await expect(runSpeech('gemini-3.8-flash-tts', { input: 'hello' })).rejects.toThrow('malformed WAV');
     });
 
     it('Gemini TTS: canonicalizes native voices and defaults unknown names', async () => {

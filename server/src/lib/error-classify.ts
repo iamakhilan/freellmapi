@@ -378,6 +378,18 @@ export function isProviderDegradedError(err: any): boolean {
   return msg.includes('degraded');
 }
 
+// A 5xx whose body blames ONE model's load, not the provider: Google answers
+// `503 "This model is currently experiencing high demand"` for a busy Gemini
+// model while its siblings on the same key keep serving. Ruling the whole
+// platform out on it left `auto` with nothing to try when that platform was
+// the only one configured. Narrow on purpose: the wording must name "this
+// model" / "the model", so a generic "service overloaded" stays provider-level.
+const MODEL_SCOPED_OVERLOAD = /\b(?:this|the) model is (?:currently )?(?:experiencing high demand|overloaded)\b/;
+
+export function isModelScopedOverloadError(err: any): boolean {
+  return MODEL_SCOPED_OVERLOAD.test((err?.message ?? '').toLowerCase());
+}
+
 // #788: provider-level failures — 5xx, timeouts, transport/network errors, a
 // degraded deployment — are symptoms of the PROVIDER being sick, not of this
 // particular key. Retrying the same provider with a sibling key would fail
@@ -403,7 +415,7 @@ export function isProviderLevelError(err: any): boolean {
   // the text is not.
   if (err?.skipModelForRequest === true) return false;
   const status = typeof err?.status === 'number' ? err.status : 0;
-  if (status >= 500) return true;
+  if (status >= 500) return !isModelScopedOverloadError(err);
   // A DEGRADED hosted deployment (NVIDIA NIM, #522) is provider health wearing
   // a 400 — same source of truth as everywhere else, not a second substring.
   if (isProviderDegradedError(err)) return true;
@@ -412,6 +424,36 @@ export function isProviderLevelError(err: any): boolean {
   return isTimeoutErrorText(msg)
     || msg.includes('econnrefused') || msg.includes('econnreset')
     || msg.includes('fetch failed');   // undici transport error (DNS/TLS/proxy down)
+}
+
+// #1347 (PR 1): provider-moment failures — the "provider had a bad minute"
+// class: a 429, a 5xx, a degraded deployment, a timeout, a transport drop
+// (including a mid-stream reset / truncated SSE), or rate-limit wording on a
+// response that carried no structured status. This is evidence about the
+// provider's minute, not the model's quality: when failure attribution is
+// enabled such failures still steer the key (the cooldown ladder is
+// untouched) but are excluded from the model-level books — the reliability
+// stats and the failure penalties. Deliberately NOT in this class: auth
+// (401/403), quota (402), model-not-found (404/410), context-too-large,
+// empty completions and model-scoped 400s, which keep their existing
+// key/model-scoped handling.
+export function isProviderMomentFailure(err: any): boolean {
+  // A canceled request (client hang-up, time-budget hedge) is the gateway's
+  // own doing. isTransportError already treats those as non-transport, but
+  // the timeout-marker text check below could still match an abort message.
+  if (isClientAbortError(err) || isHedgeAbortError(err)) return false;
+  if (err?.skipModelForRequest === true) return false;
+  const status = typeof err?.status === 'number' ? err.status : 0;
+  if (status === 429 || status >= 500) return true;
+  if (isProviderDegradedError(err)) return true;
+  if (isTransportError(err)) return true;
+  if (isStreamTruncatedError(err)) return true;
+  const msg = (err?.message ?? '').toLowerCase();
+  if (isTimeoutErrorText(msg)) return true;
+  // Rate-limit wording without a structured status: some gateways answer a
+  // throttled request with a 200/500 body that only says "rate limit".
+  if (status === 0 && (msg.includes('rate limit') || msg.includes('too many requests'))) return true;
+  return false;
 }
 
 // #809: kilo's free relay occasionally answers with a bare classification
@@ -472,14 +514,29 @@ export function isContextTooLargeError(err: any): boolean {
   if (typeof err?.code === 'string' && err.code.toLowerCase() === 'context_length_exceeded') return true;
   const msg = (err?.message ?? '').toLowerCase();
   return msg.includes('context_length_exceeded')
+    // Agnes AI and some OpenAI-compat aggregators raise a bare
+    // ContextWindowExceededError whose OpenAIException body arrives truncated
+    // mid-sentence ("The input (2250074 tokens) is longer than the mo…"), so
+    // the "maximum context length" marker below never sees its target text and
+    // the error was mis-bucketed as provider_bad_request. The exception class
+    // name is the only reliable signal left in that shape.
+    || msg.includes('contextwindowexceeded')
     || msg.includes('maximum context length')
     || msg.includes('context length exceeded')
     || /exceeds[^.]*context (length|window|size)/.test(msg)
     || msg.includes('prompt is too long')
     || msg.includes('input is too long')
     || /input token count[^.]*exceeds/.test(msg)
+    // "The input (N tokens) is longer than the max/maximum" family, worded
+    // differently by aggregators that never surface an exception class.
+    || /input[^.]*longer than (the )?(max|maximum)/.test(msg)
     || msg.includes('exceeds the maximum number of tokens')
     || msg.includes('request too large')
+    // BazaarLink: 400 "This request is too large for a free tier" (#1717).
+    // No window named, but it is a size rejection: without this it was
+    // bucketed as provider_bad_request and the next candidate got the same
+    // oversized payload.
+    || msg.includes('request is too large')
     || msg.includes('payload too large')
     || msg.includes('request entity too large')
     || msg.includes('request body too large')

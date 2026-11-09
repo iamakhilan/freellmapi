@@ -38,11 +38,13 @@ const PURE_MODULES = [
   // Signal handling for the container's PID 1; the server, DB and process are injected.
   'graceful-shutdown.ts',
   'header-value.ts',
-  // Learned output ceilings; the fallback loop and every route import it.
-  'output-cap.ts',
   'provider-identity.ts',
   'provider-size-parser.ts',
   'retry-hint.ts',
+  // Search platform list; the provider list, keys route and search service import it.
+  'search-platforms.ts',
+  // SSE keep-alive helper (#1642); env is injected, the response is a callback.
+  'stream-keepalive.ts',
   'structured-output.ts',
   'tool-args.ts',
   'tool-call-rescue.ts',

@@ -49,6 +49,8 @@ export interface EndpointRef {
   keyId?: number
   baseUrl?: string
   apiKey?: string
+  /** Group to file a NEW endpoint under on register (#1176); blank leaves it. */
+  groupLabel?: string
 }
 
 export function DiscoverModelsDialog({
@@ -78,7 +80,7 @@ export function DiscoverModelsDialog({
     queryKey: ['custom-endpoint-models', builtin, endpoint.keyId ?? null, endpoint.baseUrl ?? null],
     queryFn: () => apiFetch('/api/keys/custom/discover-models', {
       method: 'POST',
-      body: JSON.stringify(endpoint),
+      body: JSON.stringify({ keyId: endpoint.keyId, baseUrl: endpoint.baseUrl, apiKey: endpoint.apiKey }),
     }),
     retry: false,
     gcTime: 0,
@@ -98,7 +100,14 @@ export function DiscoverModelsDialog({
         body: JSON.stringify({
           ...(endpoint.keyId === undefined ? { baseUrl: endpoint.baseUrl } : { keyId: endpoint.keyId }),
           ...(endpoint.apiKey ? { apiKey: endpoint.apiKey } : {}),
-          models: [...selected],
+          ...(endpoint.groupLabel?.trim() ? { groupLabel: endpoint.groupLabel.trim() } : {}),
+          // #1506: forward each picked model's discovered kind so the server
+          // registers generic-id media/embedding models in the right table
+          // instead of re-classifying by id and dropping them to chat.
+          models: [...selected].map(id => {
+            const discovered = models.find(m => m.id === id)
+            return discovered?.kind ? { model: id, kind: discovered.kind } : id
+          }),
         }),
       }),
     onSuccess: (data) => {

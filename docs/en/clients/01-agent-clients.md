@@ -59,6 +59,7 @@ context windows.
 | **Hermes Agent** | `setup-hermes` | `http://localhost:3001/v1` | OpenAI Chat (`provider: custom`) |
 | **Pi** | `setup-pi` | `http://localhost:3001/v1` | OpenAI Chat (`api: openai-completions`) |
 | **Reasonix** | `setup-reasonix` | `http://localhost:3001/v1` | OpenAI Chat (`kind = "openai"`) |
+| **ZCode** | `setup-zcode` | `http://localhost:3001/v1` | OpenAI Chat (`openai-chat-completions`) |
 | **QwenPaw** | Manual setup | `http://localhost:3001/v1` | OpenAI Chat (`chat.completions`) |
 | **Cursor** | `setup-cursor` prints the guide | public `https://…/v1` | OpenAI Chat |
 | **Anything else** | `setup-generic` prints a ready block | `http://localhost:3001/v1` | OpenAI Chat |
@@ -66,7 +67,7 @@ context windows.
 The root-vs-`/v1` distinction matters: Claude Code expects the server root
 because it appends the Anthropic Messages path. OpenAI-compatible clients in
 this table—including Cline, Aider, Goose, Codex, Continue, OpenCode, Qwen,
-Roo, Kilo, Crush, MiMo Code, AtomCode, OpenClaw, Hermes Agent, Pi, Reasonix, QwenPaw, and DeepSeek Harness—expect their configured
+Roo, Kilo, Crush, MiMo Code, AtomCode, OpenClaw, Hermes Agent, Pi, Reasonix, ZCode, QwenPaw, and DeepSeek Harness—expect their configured
 base URL to include `/v1`.
 
 ### DeepSeek Harness (`dsh`)
@@ -125,25 +126,25 @@ requires, both taken from the live catalog.
 ### AtomCode (`atomcode`)
 
 [AtomCode](https://atomcode.atomgit.com/docs/en/) is AtomGit's terminal
-coding agent, written in Rust. It reads `~/.atomcode/config.toml`, where a
-root `default_provider` key names one `[providers.<id>]` table and
-`type = "openai"` makes that table speak the OpenAI-compatible wire.
-`setup-atomcode` writes a `[providers.freellmapi]` table — `base_url` on the
-gateway's `/v1`, the unified key as `api_key`, the chosen model and its
-`context_window` from the live catalog — and sets `default_provider` to it.
-The write is a structural merge: the root key is placed above any existing
-tables, only the `freellmapi` table is replaced, and other `[providers.*]`
-tables and settings in the file are left as they were.
+coding agent, written in Rust. It reads `~/.atomcode/config.toml`.
+`setup-atomcode` writes `[provider_accounts.freellmapi]` with `provider = "openai"`,
+the gateway's `/v1` as `base_url`, and the unified key as `api_key`.
+`[models.freellmapi]` references that account and stores the chosen model and
+its `context_window` from the live catalog. The root `default_model` selects
+this model entry, taking precedence over any legacy `default_provider`.
+The write is a structural merge: the root key is placed above existing
+tables, the two generated tables are replaced, and unrelated accounts,
+models, legacy providers and settings are preserved.
 
 ```bash
 npx freellmapi setup-atomcode --url http://localhost:3001 --api-key <unified-key>
 atomcode
 ```
 
-AtomCode has no environment-variable fallback for the key, so it is written
-into the config file; the file is created with mode 0600 and a timestamped
-backup is taken before an existing one is changed. `--model <id>` pins the
-default model.
+The generator writes the unified key into the config file; the file is
+created with mode 0600 and a timestamped backup is taken before an existing
+one is changed. `--model <id>` pins the default model. Restart AtomCode to
+load the updated configuration.
 
 ### OpenClaw
 
@@ -266,6 +267,33 @@ readout at $0. Reasonix Studio only lists the providers in
 `[desktop].provider_access` when that list is set, so add `"freellmapi"` there
 (or under Settings → Model → Access). Reasonix sends `Reasonix/<version>` as
 its user agent, which is what the Agents page's "seen recently" badge keys on.
+
+### ZCode (`zcode`)
+
+[ZCode](https://zcode.z.ai) is Z.ai's coding agent, built for its GLM models.
+Its Desktop app and CLI share one provider registry,
+`~/.zcode/v2/provider_config.json` (`ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`
+moves it). `setup-zcode` adds a `freellmapi` provider there: an `api-key`
+access block, an `openai-chat-completions` endpoint at the gateway's `/v1`,
+and one model rule per catalog model with its context and output limits. It
+also makes `freellmapi/auto` the default model. Your other providers, their
+model rules and your provider order are kept, and a rerun replaces only the
+`freellmapi` entries. ZCode has no environment-variable lookup for custom
+providers, so the key lives in that file; the writer backs the file up first
+and keeps it at `0600`.
+
+```bash
+npx freellmapi setup-zcode --url http://localhost:3001 --api-key <unified-key>
+```
+
+Quit ZCode Desktop before running it so the app does not save its in-memory
+registry over the file. Pick another `freellmapi/<model>` in the model picker
+(or `/model` in the CLI). `--profile <name>` adds a second
+`freellmapi-<name>` provider instead. ZCode tags every request with its own
+`x-zcode-app-version` and `x-title: Z Code@…` headers, which is what the
+Agents page's "seen recently" badge keys on. The older `~/.zcode/v2/config.json`
+and `~/.zcode/cli/config.json` files are only read once, for migration, so
+editing them has no effect.
 
 ### QwenPaw
 

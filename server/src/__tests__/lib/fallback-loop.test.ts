@@ -200,6 +200,29 @@ describe('isDailyQuotaExhaustedError + midnight benching (drift: 90s cooldown on
   });
 });
 
+describe('recordRetryableFailure context-length rejection (#1479)', () => {
+  it('learns the reported window and rules the model out without a cooldown or penalty', () => {
+    const modelDbId = getDb().prepare(
+      `INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, context_window)
+       VALUES ('fake', ?, 'Fake', 50, 50, 1000000)`,
+    ).run(`ctx-${keySeq}`).lastInsertRowid as number;
+    const route = fakeRoute({ modelDbId });
+    const state = newFallbackState();
+    const err = Object.assign(
+      new Error("OpenRouter API error 400: This endpoint's maximum context length is 262144 tokens. However, you requested about 404225 tokens (396033 of text input, 8192 in the output)."),
+      { status: 400 },
+    );
+    recordRetryableFailure(route, err, state);
+
+    expect(state.skipModels.has(modelDbId)).toBe(true);
+    const window = (getDb().prepare('SELECT context_window FROM models WHERE id = ?').get(modelDbId) as { context_window: number }).context_window;
+    expect(window).toBe(262144);
+    const cooldown = getDb().prepare('SELECT 1 FROM rate_limit_cooldowns WHERE platform = ? AND key_id = ?').get('fake', route.keyId);
+    expect(cooldown).toBeUndefined();
+    expect(getAllPenalties().some(p => p.modelDbId === modelDbId)).toBe(false);
+  });
+});
+
 describe('recordRetryableFailure skipBench exemption (reasoning truncation)', () => {
   it('skips cooldown + penalty but still rules the key out for this request', () => {
     const route = fakeRoute();
@@ -683,6 +706,17 @@ describe('isProviderLevelError (#788: the PROVIDER is sick, not this key)', () =
     expect(isProviderLevelError(new Error('Fake stream stalled: no data for 90000ms (timeout)'))).toBe(true);
     // A DEGRADED deployment is provider health wearing a 400 (#522).
     expect(isProviderLevelError(Object.assign(new Error("Function id 'x': DEGRADED function cannot be invoked"), { status: 400 }))).toBe(true);
+  });
+
+  it('keeps a 5xx that blames one busy model scoped to that model, not the platform', () => {
+    // Google's per-model load shedding: sibling Gemini models on the same key
+    // still serve, so `auto` must be able to fail over within the platform.
+    expect(isProviderLevelError(Object.assign(new Error(
+      'Google API error 503: This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.',
+    ), { status: 503 }))).toBe(false);
+    expect(isProviderLevelError(Object.assign(new Error('API error 503: The model is overloaded. Please try again later.'), { status: 503 }))).toBe(false);
+    // Generic overload wording that does not single out a model stays provider-level.
+    expect(isProviderLevelError(Object.assign(new Error('API error 503: Service temporarily overloaded'), { status: 503 }))).toBe(true);
   });
 
   it('does not misfire on digits or wording that merely LOOK like a 5xx', () => {

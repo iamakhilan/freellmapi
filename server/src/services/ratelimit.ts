@@ -560,10 +560,11 @@ export function modelWindowUsedFraction(
 //   PROVIDER_DAILY_REQUEST_CAP_OPENROUTER=50   (set 0 to disable the cap)
 const DEFAULT_PROVIDER_DAILY_REQUEST_CAPS: Record<string, number> = {
   openrouter: 1000,
-  // ModelScope's free tier is 2000 requests/day across the whole account (all
-  // models share it). 1800 leaves margin for validation probes and for drift
+  // ModelScope's free tier moved to magic-grain (魔粒) metering in 2026-08:
+  // ~250 魔粒/day account-wide at ~2 魔粒 per request (observed 2026-08-14)
+  // ≈ 125 requests/day. 100 leaves margin for validation probes and for drift
   // between our ledger and the provider's own daily boundary (#581).
-  modelscope: 1800,
+  modelscope: 100,
   // Requesty's free tier is 200 requests/day per account, shared by every free
   // model (requesty.ai/free-models, no card). The catalog rows each carry
   // rpd 200, so without this gate the router could spend 200 per model. 180
@@ -587,6 +588,9 @@ const DEFAULT_PROVIDER_DAILY_TOKEN_CAPS: Record<string, number> = {
 // entirely — so it keeps dispatching and eats real 429s.
 const DEFAULT_PROVIDER_MINUTE_REQUEST_CAPS: Record<string, number> = {
   nvidia: 40,
+  // APINex Free: 5 requests/minute per key shared across every model
+  // (apinex.bond/api/public/rate-limits `rpmFree`), not 5 per model.
+  apinex: 5,
 };
 
 export function getProviderDailyRequestCap(platform: string): number | null {
@@ -857,7 +861,9 @@ const cooldowns = new Map<string, number>(); // key -> expiry timestamp
 //                     no evidence the account was topped up, so never probed.
 //   'tier'          — 403 model-not-on-tier. Same reasoning: the key validates
 //                     fine while the model stays gated, so never probed.
-export type CooldownSource = 'heuristic' | 'authoritative' | 'credit' | 'tier';
+//   'checkin'       — APINex daily website check-in. Operator-resumable, but
+//                     never allowed to overwrite a provider-confirmed hold.
+export type CooldownSource = 'heuristic' | 'authoritative' | 'credit' | 'tier' | 'checkin';
 
 // Escalating cooldown: track hits per key over a rolling 24h window so a
 // daily-quota exhaustion (OpenRouter free: 50/day, Cohere free: 33/day, etc.)
@@ -1245,6 +1251,33 @@ export function setCooldown(
   const key = `${platform}:${modelId}:${keyId}:cooldown`;
   const now = Date.now();
   const expiresAtMs = now + durationMs;
+  if (source === 'checkin') {
+    // The account-wide check-in bench also visits sibling routes that may
+    // already have real credit, tier or Retry-After holds. Preserve their
+    // provenance AND expiry, otherwise "Resume key" would clear those facts.
+    // Write and check atomically; if persistence fails, do not relabel an
+    // in-memory hold whose source we cannot establish.
+    const written = withDb(db => db.transaction(() => {
+      const stored = db.prepare(`
+        SELECT 1 FROM rate_limit_cooldowns
+         WHERE platform = ? AND model_id = ? AND key_id = ?
+      `).get(platform, modelId, keyId);
+      if (!stored && (cooldowns.get(key) ?? 0) > now) return false;
+      const result = db.prepare(`
+        INSERT INTO rate_limit_cooldowns (platform, model_id, key_id, expires_at_ms, source, set_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(platform, model_id, key_id) DO UPDATE SET
+          expires_at_ms = excluded.expires_at_ms,
+          source = excluded.source,
+          set_at_ms = excluded.set_at_ms
+        WHERE rate_limit_cooldowns.expires_at_ms <= excluded.set_at_ms
+           OR rate_limit_cooldowns.source IN ('heuristic', 'checkin')
+      `).run(platform, modelId, keyId, expiresAtMs, source, now);
+      return Number(result.changes ?? 0) > 0;
+    })());
+    if (written) cooldowns.set(key, expiresAtMs);
+    return;
+  }
   cooldowns.set(key, expiresAtMs);
   persistCooldown(platform, modelId, keyId, expiresAtMs, source, now);
 }
@@ -1272,7 +1305,19 @@ export function isOnCooldown(platform: string, modelId: string, keyId: number): 
   return true;
 }
 
+/** Why an active model/key is benched. Used only after the existing cooldown gate rejects a route. */
+export function getCooldownSource(platform: string, modelId: string, keyId: number): CooldownSource | null {
+  return withDb(db => {
+    const row = db.prepare(`
+      SELECT source FROM rate_limit_cooldowns
+       WHERE platform = ? AND model_id = ? AND key_id = ? AND expires_at_ms > ?
+    `).get(platform, modelId, keyId, Date.now()) as { source: CooldownSource } | undefined;
+    return row?.source ?? null;
+  }) ?? null;
+}
+
 export interface ActiveCooldown {
+  source: CooldownSource;
   platform: string;
   modelId: string;
   keyId: number;
@@ -1298,16 +1343,17 @@ export function getActiveCooldownsForKeys(
 
   const placeholders = unique.map(() => '?').join(', ');
   const rows = withDb(db => db.prepare(`
-    SELECT platform, model_id, key_id, expires_at_ms
+    SELECT platform, model_id, key_id, expires_at_ms, source
       FROM rate_limit_cooldowns
      WHERE expires_at_ms > ?
        AND key_id IN (${placeholders})
      ORDER BY expires_at_ms ASC
-  `).all(now, ...unique) as { platform: string; model_id: string; key_id: number; expires_at_ms: number }[]) ?? [];
+  `).all(now, ...unique) as { platform: string; model_id: string; key_id: number; expires_at_ms: number; source: CooldownSource }[]) ?? [];
 
   for (const row of rows) {
     const list = grouped.get(row.key_id) ?? [];
     list.push({
+      source: row.source,
       platform: row.platform,
       modelId: row.model_id,
       keyId: row.key_id,
@@ -1347,6 +1393,38 @@ export function clearCooldownsForKey(keyId: number): number {
   }
 
   return Math.max(cleared, memoryCleared);
+}
+
+/**
+ * Remove only APINex daily website-check-in cooldowns for a key.
+ * The existing all-sources clear remains available to operators; this scoped
+ * recovery must not lift credit, tier, or provider-confirmed rate limits.
+ * Read the persisted source before touching in-memory state, so an unknown
+ * source is never cleared optimistically when the database is unavailable.
+ */
+export function clearApinexCheckinCooldownsForKey(keyId: number): number {
+  if (!Number.isInteger(keyId)) return 0;
+
+  const removed = withDb(db => db.transaction(() => {
+    const rows = db.prepare(`
+      SELECT model_id FROM rate_limit_cooldowns
+       WHERE platform = 'apinex' AND key_id = ? AND source = 'checkin'
+    `).all(keyId) as { model_id: string }[];
+
+    const result = db.prepare(`
+      DELETE FROM rate_limit_cooldowns
+       WHERE platform = 'apinex' AND key_id = ? AND source = 'checkin'
+    `).run(keyId);
+    return { modelIds: rows.map(row => row.model_id), count: Number(result.changes ?? 0) };
+  })());
+
+  if (!removed) return 0;
+  for (const modelId of removed.modelIds) {
+    const key = `apinex:${modelId}:${keyId}`;
+    cooldowns.delete(`${key}:cooldown`);
+    cooldownHits.delete(key);
+  }
+  return removed.count;
 }
 
 /**
@@ -1459,14 +1537,22 @@ export function getRateLimitStatus(
 // stop us BEFORE the next 413 instead of re-discovering it on every request.
 // (Fork-validated: andersmmg's updateLimitsFromError parses the same Groq shape.)
 
-export type LearnedLimitKind = 'tpm' | 'tpd' | 'rpm' | 'rpd';
+// 'itpm' / 'otpm' are the directional per-minute limits some Groq orgs carry
+// on top of the combined TPM: "input tokens per minute (ITPM)" counts prompt
+// tokens only, "output tokens per minute (OTPM)" counts expected completion
+// tokens only.
+export type LearnedLimitKind = 'tpm' | 'itpm' | 'otpm' | 'tpd' | 'rpm' | 'rpd';
 export interface LearnedLimit { kind: LearnedLimitKind; limit: number; }
 
 // Order matters: check the per-DAY axes before per-MINUTE so "tokens per day"
-// isn't shadowed by the "tpm" word-boundary alternative, and tokens before
-// requests so a body mentioning both lands on the more specific token ceiling.
+// isn't shadowed by the "tpm" word-boundary alternative, the directional
+// ITPM/OTPM axes before the combined TPM so "output tokens per minute" isn't
+// read as TPM, and tokens before requests so a body mentioning both lands on
+// the more specific token ceiling.
 const LIMIT_AXIS_PATTERNS: Array<{ kind: LearnedLimitKind; re: RegExp }> = [
   { kind: 'tpd', re: /tokens?\s*per\s*day|\btpd\b/i },
+  { kind: 'otpm', re: /output\s+tokens?\s*per\s*min(?:ute)?|\botpm\b/i },
+  { kind: 'itpm', re: /input\s+tokens?\s*per\s*min(?:ute)?|\bitpm\b/i },
   { kind: 'tpm', re: /tokens?\s*per\s*min(?:ute)?|\btpm\b/i },
   { kind: 'rpd', re: /requests?\s*per\s*day|\brpd\b/i },
   { kind: 'rpm', re: /requests?\s*per\s*min(?:ute)?|\brpm\b/i },
@@ -1492,8 +1578,15 @@ export function parseProviderLimit(message: string | undefined | null): LearnedL
 
 // Whitelisted column names — the only values ever interpolated into the UPDATE
 // below, so there is no injection surface despite the template literal.
-const LIMIT_COLUMN: Record<LearnedLimitKind, string> = {
-  tpm: 'tpm_limit', tpd: 'tpd_limit', rpm: 'rpm_limit', rpd: 'rpd_limit',
+// The router's tpm_limit gate scores input estimate + output reserve, so an
+// ITPM ceiling is a safe (slightly conservative) bound for it. An OTPM ceiling
+// has no column: it bounds the completion alone, and writing it into tpm_limit
+// would size out every request whose PROMPT exceeds it — one OTPM 1000
+// rejection permanently capped a 7000-ITPM Groq model at 1000 tokens. The
+// rejected request is already skipped for this model (context-too-large path),
+// which is all an OTPM rejection calls for.
+const LIMIT_COLUMN: Record<LearnedLimitKind, string | null> = {
+  tpm: 'tpm_limit', itpm: 'tpm_limit', otpm: null, tpd: 'tpd_limit', rpm: 'rpm_limit', rpd: 'rpd_limit',
 };
 
 /**
@@ -1508,10 +1601,93 @@ export function learnLimitFromError(modelDbId: number, err: { message?: string }
   const parsed = parseProviderLimit(err?.message);
   if (!parsed) return null;
   const col = LIMIT_COLUMN[parsed.kind];
+  if (col == null) return null;
   const result = withDb(db =>
     db.prepare(
       `UPDATE models SET ${col} = ? WHERE id = ? AND (${col} IS NULL OR ${col} > ?)`,
     ).run(parsed.limit, modelDbId, parsed.limit),
   );
   return result && result.changes > 0 ? parsed : null;
+}
+
+// ── Learning real context windows from context-length rejections (#1479) ──
+// The catalog's context_window is the model's advertised window, but a relay
+// can route to an endpoint with a smaller one. Observed live: OpenRouter's
+// nvidia/nemotron-3-super-120b-a12b:free passed the pre-dispatch size gate and
+// then answered "This endpoint's maximum context length is 262144 tokens".
+// Without learning that ceiling, every later oversized request dispatches to
+// the same endpoint and fails the same way.
+//
+// Each pattern is anchored on a context-window phrase from a real provider
+// body, so a token count elsewhere in the message (the requested size, an
+// output budget) is never read as the window.
+const CONTEXT_WINDOW_PATTERNS: RegExp[] = [
+  // OpenAI / OpenRouter / vLLM / DeepSeek: "maximum context length is 262144 tokens"
+  /maximum context length (?:is|of)\s+([\d,]+)/i,
+  // Mistral: "too large for model with 131072 maximum context length"
+  /([\d,]+)\s+maximum context length/i,
+  // Anthropic: "prompt is too long: 210000 tokens > 200000 maximum"
+  /prompt is too long:\s*[\d,]+\s*tokens\s*>\s*([\d,]+)\s*maximum/i,
+  // Google: "exceeds the maximum number of tokens allowed (1048576)"
+  /exceeds the maximum number of tokens allowed\s*\(([\d,]+)\)/i,
+];
+// A window below this is almost certainly a misread, and a wrong low value
+// would size the model out of nearly every request until the next catalog sync.
+export const MIN_LEARNED_CONTEXT_WINDOW = 1024;
+
+// Share of a refused request's size recorded as the window when the provider
+// names none. Below 1 so the next request of the same size is sized out too,
+// even though the token estimate is approximate.
+const UNKNOWN_WINDOW_FRACTION = 0.9;
+// Per-minute / per-day wording marks a throughput ceiling, not a window.
+const THROUGHPUT_REJECTION = /per (minute|day)|\btp[md]\b|rate.?limit/i;
+
+function windowFromRefusedSize(message: string | undefined | null, requestTokens: number | undefined): number | null {
+  if (requestTokens == null || !Number.isFinite(requestTokens)) return null;
+  if (message && THROUGHPUT_REJECTION.test(message)) return null;
+  const window = Math.floor(requestTokens * UNKNOWN_WINDOW_FRACTION);
+  return window >= MIN_LEARNED_CONTEXT_WINDOW ? window : null;
+}
+
+/** The context window a provider names when it rejects a prompt as too long,
+ *  or null when the message names none. */
+export function parseProviderContextWindow(message: string | undefined | null): number | null {
+  if (!message) return null;
+  for (const re of CONTEXT_WINDOW_PATTERNS) {
+    const m = message.match(re);
+    if (!m) continue;
+    const window = Number(m[1]!.replace(/,/g, ''));
+    if (Number.isFinite(window) && window >= MIN_LEARNED_CONTEXT_WINDOW) return window;
+  }
+  return null;
+}
+
+/**
+ * Persist a provider-reported context window onto the model row, with the same
+ * only-more-conservative rule as learnLimitFromError: fill an unknown window
+ * or lower one that was too high, never raise it. The router's context gates
+ * then size the model out of prompts it cannot hold before they dispatch.
+ * Returns the learned window when the row changed, else null.
+ *
+ * When the rejection names no window (BazaarLink: "This request is too large
+ * for a free tier", #1717) but the caller knows the size of the request that
+ * was refused, the window is learned as UNKNOWN_WINDOW_FRACTION of that size:
+ * the model provably cannot hold it, so later requests that big route
+ * elsewhere instead of being re-shipped to it. Throughput rejections (Groq's
+ * per-minute "Request too large ... TPM") are a tpm_limit, not a window, and
+ * are left to learnLimitFromError.
+ */
+export function learnContextWindowFromError(
+  modelDbId: number,
+  err: { message?: string },
+  requestTokens?: number,
+): number | null {
+  const window = parseProviderContextWindow(err?.message) ?? windowFromRefusedSize(err?.message, requestTokens);
+  if (window == null) return null;
+  const result = withDb(db =>
+    db.prepare(
+      'UPDATE models SET context_window = ? WHERE id = ? AND (context_window IS NULL OR context_window > ?)',
+    ).run(window, modelDbId, window),
+  );
+  return result && result.changes > 0 ? window : null;
 }

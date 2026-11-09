@@ -145,6 +145,10 @@ before rotating.
 Request analytics are retained for 90 days or 100000 request rows by default,
 whichever limit prunes first. Set `REQUEST_ANALYTICS_RETENTION_DAYS=0` or
 `REQUEST_ANALYTICS_MAX_ROWS=0` in `.env` to disable either retention limit.
+The provider quota history (`provider_quota_observations`) is kept for 7 days
+or 50000 rows by default; tune it with `QUOTA_OBSERVATIONS_RETENTION_DAYS` and
+`QUOTA_OBSERVATIONS_MAX_ROWS`. Pruning frees pages inside the database file but
+does not shrink it; run `VACUUM` while the app is stopped to reclaim disk space.
 
 Open http://localhost:5173 (the Vite dev UI), add your provider keys on the **Keys** page, reorder the **Fallback Chain** to taste, and grab your unified API key from the **Keys** page header. That unified key is what you point your OpenAI SDK at.
 
@@ -344,6 +348,9 @@ install. For the server (non-desktop) deployment, the equivalent state is the
 **Desktop app — there is no password.** The dashboard signs itself in with a
 hidden local account, so there is nothing to remember and nothing to reset. If
 you cannot see the dashboard, open it from the tray icon → **Open Dashboard**.
+A browser tab on the same computer (for example http://127.0.0.1:31415) signs in
+the same way. Only another device reaching the app over LAN access is asked to
+sign in.
 
 **Server installs** (Docker, one-liner, `npm run dev`) do have an email +
 password account, and there is no email delivery to send a reset link to. The
