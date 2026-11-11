@@ -109,6 +109,8 @@ export type Platform =
   | 'varosity'
   // Native TTS and transcription; one shared renewable monthly credit grant.
   | 'rime'
+  // Local personal BYOK TTS; shared monthly characters, watermarked Free audio.
+  | 'freetts'
   // Research API; chat and embeddings share a daily quota. Requests are logged.
   | 'freeinference'
   // Personal BYOK client; shared monthly account allowance, Telegram verification.
@@ -141,6 +143,10 @@ export type Platform =
   // published. Catalog rows live in the hosted catalog (premium now, free after
   // 30 days).
   | 'anyapi'
+  // PowerTokens — OpenAI-compatible gateway (api.powertokens.ai). Free model
+  // glm-4.7-flash ($0 / 1M in+out, 0 Credits). RPM/RPD unpublished. Hosted
+  // catalog only (no migration seed), same as the anyapi/bai gateways.
+  | 'powertokens'
   // AMD Radeon Cloud TokenFactory — OpenAI-compatible shared inference. Its
   // rotating public-model roster is free without consuming instance credits,
   // with recurring account-level allowance and request/concurrency controls.
